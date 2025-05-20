@@ -100,8 +100,10 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         scorer_worker=target_worker,
         draft_worker_kwargs=draft_worker_kwargs,
         disable_mqa_scorer=speculative_config.disable_mqa_scorer,
-        disable_by_batch_size=speculative_config.disable_by_batch_size,
-        draft_token_acceptance_method=speculative_config.acceptance_method,
+        disable_by_batch_size=speculative_config.
+        disable_by_batch_size,
+        draft_token_acceptance_method=speculative_config.
+        acceptance_method,
         typical_acceptance_sampler_posterior_threshold=speculative_config.
         posterior_threshold,
         typical_acceptance_sampler_posterior_alpha=speculative_config.
@@ -198,13 +200,19 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 if draft_model_config.hf_config.model_type == "eagle":
                     enable_lm_head_weight_load = True
 
+
                 proposer_worker = MultiStepWorker(**draft_worker_kwargs)
+
                 if draft_model_config.hf_config.model_type == "deepseek_mtp":
                     num_spec_prefill_steps = \
                         draft_model_config.hf_config.n_predict
 
             proposer_worker = SmallerTpProposerWorker.maybe_wrap_worker(
                 proposer_worker, draft_tp, target_tp)
+            pard = draft_model_config.hf_config.__dict__.get('spd_type', None) == 'pard'
+            proposer_worker.pard = pard
+            if pard:
+                proposer_worker.pard_token = draft_model_config.hf_config.__dict__['pard_token']
 
         logger.info("Configuring SpecDecodeWorker with proposer=%s",
                     type(proposer_worker))
@@ -255,7 +263,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             spec_decode_sampler=spec_decode_sampler,
             allow_zero_draft_token_step=allow_zero_draft_token_step,
             enable_lm_head_weight_load=enable_lm_head_weight_load,
-            num_spec_prefill_steps=num_spec_prefill_steps)
+            num_spec_prefill_steps=num_spec_prefill_steps,
+            )
 
     def __init__(
         self,
@@ -341,6 +350,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self._disable_log_stats = disable_log_stats
         self._num_spec_prefill_steps = num_spec_prefill_steps
 
+
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
         """
@@ -386,6 +396,12 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                  device=self.device,
                                  vocab_size=self._vocab_size)
 
+
+        if self.proposer_worker.pard:
+            self.proposer_worker.pard_scorer = scorer_cls(scorer_worker=self.proposer_worker,
+                                 device=self.device,
+                                 vocab_size=self._vocab_size)
+
         self._configure_model_sampler_for_spec_decode()
 
     def load_model(self, *args, **kwargs):
@@ -410,9 +426,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         NOTE(cade): This will require a special check if the proposer worker
         does not have a sampler (e.g. ngram speculation).
         """
-        (self.scorer_worker.model_runner.sampler.include_gpu_probs_tensor
+        (self.scorer_worker.model_runner.model.sampler.include_gpu_probs_tensor
          ) = True
-        (self.scorer_worker.model_runner.sampler.
+        (self.scorer_worker.model_runner.model.sampler.
          should_modify_greedy_probs_inplace) = True
         self.proposer_worker.set_include_gpu_probs_tensor()
         self.proposer_worker.set_should_modify_greedy_probs_inplace()
@@ -695,7 +711,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                     seq_group_meta_with_hidden):
                 self.previous_hidden_states.update(hidden_states,
                                                    seq_group_meta_with_hidden)
-                self.previous_hidden_states.prune(seq_group_meta_with_hidden)
 
         if not skip_proposer:
             # We prepare the prefill hidden states here so that there no
@@ -733,6 +748,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         if not data:
             return False
         num_lookahead_slots = data["num_lookahead_slots"]
+        if self.proposer_worker.pard:
+            num_lookahead_slots = 1
 
         # In case of prefill, scorer_worker has to be run before proposer so
         # that the hidden states can be propagated to proposer when needed.
@@ -778,7 +795,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         # Pass last hidden states from target model to proposer
         execute_model_req.previous_hidden_states = self.previous_hidden_states
         self.previous_hidden_states = None
-
+        
         with Timer() as proposal_timer:
             # Generate proposals using draft worker.
             proposals = self.proposer_worker.get_spec_proposals(
@@ -792,6 +809,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         execute_model_req.previous_hidden_states = None
 
         with Timer() as scoring_timer:
+            # import ipdb; ipdb.set_trace()
             proposal_scores = self.scorer.score_proposals(
                 execute_model_req,
                 proposals,
@@ -1256,8 +1274,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             worker.vocab_size
             for worker in [self.proposer_worker, self.scorer_worker]
         ]
-        assert all(vocab_sizes[0] == vocab_size for vocab_size in vocab_sizes)
-        return vocab_sizes[0]
+        if not self.proposer_worker.pard:
+            assert all(vocab_sizes[0] == vocab_size for vocab_size in vocab_sizes)
+        return vocab_sizes[1]
 
     @property
     def rank(self):
