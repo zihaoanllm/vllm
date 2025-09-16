@@ -2562,7 +2562,7 @@ class DeviceConfig:
             self.device = torch.device(self.device_type)
 
 
-SpeculativeMethod = Literal["ngram", "eagle", "eagle3", "medusa",
+SpeculativeMethod = Literal["ngram", "rpc", "eagle", "eagle3", "medusa",
                             "mlp_speculator", "draft_model", "deepseek_mtp"]
 
 
@@ -2725,6 +2725,8 @@ class SpeculativeConfig:
                 self.model = self.target_model_config.model
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
+            elif self.method in ("rpc", "RPC"):
+                self.model = "rpc"
             else:
                 raise ValueError("num_speculative_tokens was provided without "
                                  "speculative model.")
@@ -2735,9 +2737,10 @@ class SpeculativeConfig:
                                     and self.model in ("ngram", "[ngram]")):
             self.method = "ngram"
 
-        if self.method in ("ngram", "[ngram]"):
+        if self.method in ("ngram", "[ngram]", "rpc"):
             # Unified to "ngram" internally
-            self.method = "ngram"
+            if self.method == "[ngram]":
+                self.method = "ngram"
             # Set default values if not provided
             if (self.prompt_lookup_min is None
                     and self.prompt_lookup_max is None):
@@ -3018,7 +3021,7 @@ class SpeculativeConfig:
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method == "ngram" else self.draft_model_config.model
+        model = None if method in ("ngram", "rpc") else self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
 

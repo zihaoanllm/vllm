@@ -65,6 +65,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.rpc_proposer import RpcProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
@@ -179,6 +180,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "rpc":
+                self.drafter = RpcProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device,
                                              self)  # type: ignore
@@ -1611,6 +1614,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert isinstance(self.drafter, NgramProposer)
             spec_token_ids = self.propose_ngram_draft_token_ids(
                 sampled_token_ids)
+        elif self.speculative_config.method == "rpc":
+            assert isinstance(self.drafter, RpcProposer)
+            spec_token_ids = self.propose_rpc_draft_token_ids(
+                sampled_token_ids)
         elif self.speculative_config.method == "medusa":
             assert isinstance(self.drafter, MedusaProposer)
             if sample_hidden_states.shape[0] == len(sampled_token_ids):
@@ -1742,6 +1749,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return output
 
     def propose_ngram_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+    ) -> list[list[int]]:
+        # TODO(woosuk): Optimize.
+        draft_token_ids: list[list[int]] = []
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+            if not num_sampled_ids:
+                # Skip speculative decoding.
+                draft_token_ids.append([])
+                continue
+
+            # Skip requests that require sampling parameters that are not
+            # supported with speculative decoding.
+            req_id = self.input_batch.req_ids[i]
+            if req_id in self.input_batch.spec_decode_unsupported_reqs:
+                draft_token_ids.append([])
+                continue
+
+            num_tokens = self.input_batch.num_tokens_no_spec[i]
+            if num_tokens >= self.max_model_len:
+                # Skip requests that have already reached the max model length.
+                draft_token_ids.append([])
+                continue
+
+            drafter_output = self.drafter.propose(
+                self.input_batch.token_ids_cpu[i, :num_tokens])
+            if drafter_output is None or len(drafter_output) == 0:
+                draft_token_ids.append([])
+            else:
+                draft_token_ids.append(drafter_output.tolist())
+        return draft_token_ids
+
+    def propose_rpc_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
