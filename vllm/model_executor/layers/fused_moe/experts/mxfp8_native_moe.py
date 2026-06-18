@@ -152,7 +152,11 @@ def _grouped_gemm_mxfp8(
     # written — zero them so the downstream reduction ignores their garbage.
     alloc = torch.zeros if expert_map is not None else torch.empty
     out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
-    BLOCK_K = 128
+    # BLOCK_K=256 halves the K-loop trip count and feeds the CDNA4 block-scaled MX
+    # matrix cores wider, lifting the FLOP-bound expert GEMMs ~1.1-1.2x on gfx950.
+    # The kernel's K-loop is unmasked (requires BLOCK_K | K), so fall back to 128
+    # when K is not a multiple of 256.
+    BLOCK_K = 256 if K % 256 == 0 else 128
     grid = (triton.cdiv(sorted_token_ids.shape[0], block_m), triton.cdiv(N, block_n))
     _mxfp8_grouped_gemm_kernel[grid](
         a_q,

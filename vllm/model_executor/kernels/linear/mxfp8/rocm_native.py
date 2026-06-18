@@ -80,6 +80,41 @@ def _mxfp8_linear_kernel(
     )
 
 
+# Per-shape tuned launch tiles (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages,
+# waves_per_eu) for the fused block-scaled ``tl.dot_scaled`` kernel on gfx950 (CDNA4),
+# measured at the MiniMax-M3 projection shapes. Keyed by (N, K); is_decode := M <= 32.
+# Refines the earlier coarse M>=1024 split: decode wants a thin BLOCK_M=16 + deep
+# BLOCK_K=256 to keep the MFMA fed at small M; prefill wants a fat tile. All BLOCK_K
+# are %128 (dot_scaled microscale tiling requirement).
+_MXFP8_DECODE_CFG = {
+    (2560, 6144): (16, 64, 256, 2, 2, 2),
+    (6144, 2048): (16, 64, 256, 2, 3, 2),
+    (1536, 6144): (16, 64, 256, 2, 2, 2),
+    (6144, 768): (16, 64, 256, 2, 3, 0),
+    (6144, 6144): (16, 64, 256, 2, 2, 2),
+}
+_MXFP8_PREFILL_CFG = {
+    (2560, 6144): (256, 128, 256, 8, 2, 2),
+    (6144, 2048): (128, 128, 256, 4, 2, 2),
+    (1536, 6144): (128, 128, 256, 8, 2, 2),
+    (6144, 768): (128, 128, 128, 8, 3, 0),
+    (6144, 6144): (128, 128, 256, 4, 2, 2),
+}
+
+
+def _select_mxfp8_linear_cfg(M: int, N: int, K: int):
+    """Return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, waves_per_eu)."""
+    if M <= 32:
+        cfg = _MXFP8_DECODE_CFG.get((N, K))
+        if cfg is not None:
+            return cfg
+        return (16, 64, 256 if K % 256 == 0 else 128, 2, 2, 0)
+    cfg = _MXFP8_PREFILL_CFG.get((N, K))
+    if cfg is not None:
+        return cfg
+    return (128, 128, 256 if K % 256 == 0 else 128, 8, 2, 0)
+
+
 def _mxfp8_dot_scaled_linear(
     x: torch.Tensor,  # [M, K] bf16/fp16
     w: torch.Tensor,  # [N, K] fp8 e4m3
@@ -89,13 +124,9 @@ def _mxfp8_dot_scaled_linear(
     N = w.shape[0]
     x_q, x_scale = mxfp8_e4m3_quantize(x)
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    # Regime-gated launch tiles for gfx950, tuned at MiniMax-M3 shapes:
-    # for example, 8k/1k, 1k/1k
-    if M >= 1024:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 256, 8, 2
-    else:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-    BLOCK_K = 128
+    BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, waves_per_eu = (
+        _select_mxfp8_linear_cfg(M, N, K)
+    )
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
         x_q,
@@ -121,6 +152,7 @@ def _mxfp8_dot_scaled_linear(
         BLOCK_K=BLOCK_K,
         num_warps=num_warps,
         num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
     return out
 
